@@ -1,0 +1,60 @@
+{
+  "selected_model": "xgboost",
+  "features": [
+    "rainfall_24h",
+    "rainfall_7d",
+    "elevation",
+    "slope",
+    "historical_landslides"
+  ],
+  "rows": 500,
+  "metrics": {
+    "random_forest": {
+      "accuracy": 0.6,
+      "precision": 0.6,
+      "recall": 0.5806451612903226,
+      "f1": 0.5901639344262295,
+      "roc_auc": 0.6561699948796723,
+      "confusion_matrix": [
+        [
+          39,
+          24
+        ],
+        [
+          26,
+          36
+        ]
+      ]
+    },
+    "xgboost": {
+      "accuracy": 0.552,
+      "precision": 0.5483870967741935,
+      "recall": 0.5483870967741935,
+      "f1": 0.5483870967741935,
+      "roc_auc": 0.6139272913466463,
+      "confusion_matrix": [
+        [
+          35,
+          28
+        ],
+        [
+          28,
+          34
+        ]
+      ]
+    }
+  },
+  "limitations": {
+    "model_name": "xgboost",
+    "features": [
+      "rainfall_24h",
+      "rainfall_7d",
+      "elevation",
+      "slope",
+      "historical_landslides"
+    ],
+    "training_rows": 500,
+    "label_definition": "NASA GLC events vs spatial background samples; background is not verified non-landslide",
+    "validation": "stratified holdout 25%; no spatial cross-validation"
+  }
+}

@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.db
+.env
+models/*.joblib
+models/evaluation.json
+data/raw/*
+data/processed/*

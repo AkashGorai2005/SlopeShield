@@ -1,0 +1,15 @@
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    container_name: SLOPESHIELD-postgis
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: SLOPESHIELD
+      POSTGRES_USER: SLOPESHIELD
+      POSTGRES_PASSWORD: SLOPESHIELD
+    ports:
+      - "5432:5432"
+    volumes:
+      - SLOPESHIELD_pgdata:/var/lib/postgresql/data
+volumes:
+  SLOPESHIELD_pgdata:

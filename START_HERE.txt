@@ -1,0 +1,36 @@
+SLOPESHIELD NER — COMPLETE BUILD
+==============================
+
+Windows quick start
+-------------------
+1. Extract the ZIP.
+2. Open the SIH folder.
+3. Double-click run_SLOPESHIELD.bat.
+4. The launcher installs dependencies, creates the Python environment, attempts the real-source data + ML pipeline, starts PostgreSQL/PostGIS if Docker is available, and launches the website.
+5. Website: http://127.0.0.1:5173
+6. API: http://127.0.0.1:8000
+7. API docs: http://127.0.0.1:8000/docs
+
+No manual code edits are required for the normal local demo.
+
+REAL DATA SOURCES
+-----------------
+- NASA Global Landslide Catalog export
+- Open-Meteo historical weather
+- OpenTopoData SRTM elevation / point-sampled slope
+- Bhuvan/ISRO is documented for contextual geospatial layers; no unverified layer is silently claimed as model input.
+
+MODEL
+-----
+- Random Forest baseline
+- XGBoost candidate
+- Accuracy, precision, recall, F1, ROC-AUC and confusion matrix
+- Model is saved to backend/models/landslide_model.joblib
+
+IMPORTANT SCIENTIFIC NOTE
+-------------------------
+The pipeline never invents official data or ML accuracy. NASA event records are positives; spatial background samples are explicitly labelled as background, not verified non-landslide observations. Slope is sampled from SRTM points, not a full DEM raster derivative. For final SIH scientific claims, replace those limitations with the strongest authoritative datasets available to the team.
+
+NO IOT
+------
+SLOPESHIELD NER is intentionally software-only. No ESP32, physical sensor, sensor simulator or IoT feed is used.

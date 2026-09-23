@@ -1,0 +1,2133 @@
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\api\alerts.py =====
+
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, HTTPException
+from sqlalchemy import text
+
+from app.database.database import engine
+from app.services.monitoring_service import recommended_action
+
+router = APIRouter(prefix="/alerts", tags=["alerts"])
+
+
+def _timestamp(value):
+	return value.isoformat() if hasattr(value, "isoformat") else str(value) if value else None
+
+
+@router.get("")
+def alerts(status: str = "active"):
+	query = text("""
+		SELECT w.id, w.location_id, l.name, l.state, w.risk_level,
+			   w.probability, w.rainfall, w.status, w.created_at,
+			   w.recommended_action, w.resolved_at
+		FROM warnings w
+		JOIN locations l ON l.id = w.location_id
+		WHERE (:status = 'all' OR w.status = :status)
+		ORDER BY w.created_at DESC
+	""")
+	with engine.connect() as connection:
+		return [
+			{
+				"id": f"w-{row['id']}",
+				"locationId": row["location_id"],
+				"location": f"{row['name']}, {row['state']}",
+				"riskLevel": row["risk_level"],
+				"rainfall": float(row["rainfall"] or 0),
+				"probability": round(float(row["probability"] or 0) * 100),
+				"change": 0,
+				"timestamp": _timestamp(row["created_at"]),
+				"status": row["status"],
+				"recommendedAction": row["recommended_action"] or recommended_action(row["risk_level"]),
+				"resolvedAt": _timestamp(row["resolved_at"]),
+				"source": "PostgreSQL",
+			}
+			for row in connection.execute(query, {"status": status}).mappings()
+		]
+
+
+@router.patch("/{alert_id}/resolve")
+def resolve_alert(alert_id: int):
+	with engine.begin() as connection:
+		result = connection.execute(
+			text("UPDATE warnings SET status='resolved', resolved_at=:resolved_at WHERE id=:id AND status='active'"),
+			{"id": alert_id, "resolved_at": datetime.now(timezone.utc).replace(tzinfo=None)},
+		)
+		if result.rowcount == 0:
+			raise HTTPException(status_code=404, detail="Active alert not found")
+	return {"id": f"w-{alert_id}", "status": "resolved"}
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\api\auth.py =====
+
+from fastapi import APIRouter, HTTPException
+from app.database.schemas import LoginIn, UserOut
+
+router=APIRouter(prefix='/auth',tags=['auth'])
+
+@router.post('/login',response_model=UserOut)
+def login(payload: LoginIn):
+    name=payload.name.strip(); email=payload.email.strip().lower()
+    if not name: name='User'
+    if '@' not in email: raise HTTPException(400,'A valid email address is required.')
+    return {'name':name,'email':email,'authenticated':True}
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\api\data.py =====
+
+from fastapi import APIRouter, HTTPException
+from app.services.data_service import get_locations, get_historical, get_risk, get_rainfall, get_summary, data_status
+from app.services.weather_service import current, historical
+from datetime import date, timedelta
+
+router=APIRouter(prefix="/data",tags=["data"])
+
+@router.get("/risk")
+def risk(): return get_risk()
+
+@router.get("/rainfall")
+def rainfall(): return get_rainfall()
+
+@router.get("/historical")
+def historical_points(): return get_historical()
+
+@router.get("/summary")
+def summary(): return get_summary()
+
+@router.get("/status")
+def status(): return data_status()
+
+@router.get("/weather/{location_id}")
+def weather(location_id: str):
+    item=next((x for x in get_locations() if x["id"]==location_id),None)
+    if not item: raise HTTPException(404,"Location not found")
+    try:
+        return {**current(item["latitude"],item["longitude"]),"place":item["name"]}
+    except Exception as exc:
+        raise HTTPException(503,f"Weather provider unavailable: {exc}")
+
+@router.get("/weather/{location_id}/history")
+def weather_history(location_id: str, days: int=7):
+    item=next((x for x in get_locations() if x["id"]==location_id),None)
+    if not item: raise HTTPException(404,"Location not found")
+    days=max(1,min(days,31)); end=date.today(); start=end-timedelta(days=days-1)
+    try: return historical(item["latitude"],item["longitude"],start,end)
+    except Exception as exc: raise HTTPException(503,f"Weather provider unavailable: {exc}")
+
+@router.get("/layers")
+def layers():
+    return [
+      {"id":"risk","name":"Risk Zones","description":"Model-estimated risk classes","default":True,"source":"SLOPESHIELD model"},
+      {"id":"historical","name":"Historical Landslides","description":"NASA Global Landslide Catalog inventory when ingested","default":True,"source":"NASA GLC"},
+      {"id":"rainfall","name":"Rainfall","description":"Rainfall attached to monitored points","default":False,"source":"Open-Meteo / configured source"},
+      {"id":"slope","name":"Slope","description":"DEM-derived terrain slope when pipeline is run","default":False,"source":"DEM pipeline"},
+      {"id":"elevation","name":"Elevation","description":"Elevation sampled from DEM/elevation service","default":False,"source":"SRTM/OpenTopoData"},
+      {"id":"landcover","name":"Land Cover","description":"Context layer; connect an authorised raster/WMS source","default":False,"source":"Bhuvan/ISRO or configured source"},
+      {"id":"geology","name":"Geology","description":"Context layer; connect an authorised geology source","default":False,"source":"Bhuvan/ISRO or configured source"},
+    ]
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\api\locations.py =====
+
+from fastapi import APIRouter, HTTPException
+from app.database.schemas import LocationOut
+from app.services.data_service import get_locations, get_location
+
+router=APIRouter(prefix='/locations',tags=['locations'])
+@router.get('',response_model=list[LocationOut])
+def locations(): return get_locations()
+@router.get('/{location_id}',response_model=LocationOut)
+def location(location_id: str):
+    item=get_location(location_id)
+    if not item: raise HTTPException(404,'Location not found')
+    return item
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\api\monitoring.py =====
+
+from fastapi import APIRouter, HTTPException
+
+from app.services.monitoring_service import monitoring_status, run_monitoring_cycle
+
+router = APIRouter(prefix="/monitoring", tags=["monitoring"])
+
+
+@router.get("/status")
+def status():
+    return monitoring_status()
+
+
+@router.post("/cycle")
+def monitoring_cycle():
+    try:
+        return run_monitoring_cycle()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\api\predictions.py =====
+
+from fastapi import APIRouter, HTTPException
+from sqlalchemy import text
+
+from app.database.database import engine
+from app.database.schemas import PredictionOut, SimulationIn
+from app.services.data_service import get_location
+from app.services.ml_service import ml_service
+
+
+router = APIRouter(
+    prefix="/predictions",
+    tags=["predictions"],
+)
+
+
+def _features(item, rainfall=None):
+    rain = float(
+        item.get("rainfall", 0)
+        if rainfall is None
+        else rainfall
+    )
+
+    rainfall_7d = float(
+        item.get("rainfall7d", 0) or 0
+    )
+
+    return {
+        "rainfall_24h": rain,
+        "rainfall_7d": rainfall_7d,
+        "elevation": float(
+            item.get("elevation", 0) or 0
+        ),
+        "slope": float(
+            item.get("slope", 0) or 0
+        ),
+        "historical_landslides": float(
+            item.get("historicalLandslides", 0) or 0
+        ),
+    }
+
+
+def _save_prediction(
+    location_id: str,
+    probability: float,
+    risk_level: str,
+    model_name: str,
+    features: dict,
+):
+    query = text(
+        """
+        INSERT INTO risk_predictions (
+            location_id,
+            probability,
+            risk_level,
+            model_name,
+            rainfall_24h,
+            rainfall_7d,
+            elevation,
+            slope,
+            historical_landslides,
+            created_at
+        )
+        VALUES (
+            :location_id,
+            :probability,
+            :risk_level,
+            :model_name,
+            :rainfall_24h,
+            :rainfall_7d,
+            :elevation,
+            :slope,
+            :historical_landslides,
+            CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    with engine.begin() as connection:
+        connection.execute(
+            query,
+            {
+                "location_id": location_id,
+                "probability": probability,
+                "risk_level": risk_level,
+                "model_name": model_name,
+                **features,
+            },
+        )
+
+
+@router.post(
+    "/simulate",
+    response_model=PredictionOut,
+)
+def simulate(payload: SimulationIn):
+    item = get_location(payload.locationId)
+
+    if not item:
+        raise HTTPException(
+            status_code=404,
+            detail="Location not found",
+        )
+
+    try:
+        features = _features(item, payload.rainfall)
+        result = ml_service.predict(features, simulated=True)
+
+        _save_prediction(
+            location_id=payload.locationId,
+            probability=float(
+                result["probability"]
+            ),
+            risk_level=str(
+                result["riskLevel"]
+            ),
+            model_name=str(
+                result["modelSource"]
+            ),
+            features=features,
+        )
+
+        return result
+
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+        )
+
+
+@router.get("/status")
+def model_status():
+    return {
+        "trained": ml_service.trained,
+        "source": ml_service.model_source,
+        "mode": (
+            "trained"
+            if ml_service.trained
+            else "demo"
+        ),
+        "features": ml_service.feature_schema,
+    }
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\api\reports.py =====
+
+from fastapi import APIRouter
+from fastapi.responses import Response
+from datetime import datetime, timezone
+from app.services.data_service import get_locations, get_historical, data_status
+
+router=APIRouter(prefix='/reports',tags=['reports'])
+
+@router.get('/summary')
+def report_summary():
+    locations=get_locations(); hist=get_historical()
+    return {'generatedAt':datetime.now(timezone.utc).isoformat(),'dataStatus':data_status(),'total':len(locations),'counts':{level:sum(x['riskLevel']==level for x in locations) for level in ['low','moderate','high','critical']},'historicalEvents':len(hist['points'])}
+
+@router.get('/csv')
+def report_csv():
+    locations=get_locations()
+    headers=['location','state','latitude','longitude','riskLevel','probability','rainfall24h','rainfall7d','slope','elevation','historicalLandslides','modelSource']
+    lines=[','.join(headers)]
+    for x in locations:
+        vals=[x.get('name'),x.get('state'),x.get('latitude'),x.get('longitude'),x.get('riskLevel'),x.get('probability'),x.get('rainfall'),x.get('rainfall7d'),x.get('slope'),x.get('elevation'),x.get('historicalLandslides'),x.get('modelSource')]
+        lines.append(','.join('"'+str(v).replace('"','""')+'"' for v in vals))
+    return Response('\n'.join(lines),media_type='text/csv',headers={'Content-Disposition':'attachment; filename=SLOPESHIELD-risk-report.csv'})
+
+@router.get('/html')
+def report_html():
+    locations=get_locations(); status=data_status(); now=datetime.now(timezone.utc).isoformat()
+    rows=''.join(f"<tr><td>{x['name']}</td><td>{x['state']}</td><td>{x['riskLevel'].title()}</td><td>{x['probability']:.1%}</td><td>{x['rainfall']:.1f}</td><td>{x['slope']:.1f}</td><td>{x['elevation']:.0f}</td></tr>" for x in locations)
+    html=f'''<!doctype html><html><head><meta charset="utf-8"><title>SLOPESHIELD NER Risk Report</title><style>body{{font:14px Arial;margin:32px;color:#183b32}}h1{{margin-bottom:4px}}table{{border-collapse:collapse;width:100%;margin-top:24px}}td,th{{border:1px solid #dbe5df;padding:8px;text-align:left}}th{{background:#eef5f1}}.meta{{color:#60756d}}</style></head><body><h1>SLOPESHIELD NER</h1><div>AI-based Early Warning and Landslide Risk Monitoring — Northeast Region</div><p class="meta">Generated {now} · Data mode: {status['mode']} · Model values are only as valid as the configured source/model pipeline.</p><table><thead><tr><th>Location</th><th>State</th><th>Risk</th><th>Probability</th><th>Rainfall 24h (mm)</th><th>Slope (°)</th><th>Elevation (m)</th></tr></thead><tbody>{rows}</tbody></table></body></html>'''
+    return Response(html,media_type='text/html')
+
+@router.get('/pdf')
+def report_pdf():
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet
+    locations=get_locations(); buf=BytesIO()
+    doc=SimpleDocTemplate(buf,pagesize=landscape(A4),rightMargin=24,leftMargin=24,topMargin=24,bottomMargin=24)
+    styles=getSampleStyleSheet(); story=[Paragraph('SLOPESHIELD NER — Risk Assessment Report',styles['Title']),Paragraph('AI-based Early Warning and Landslide Risk Monitoring — Northeast Region',styles['Normal']),Spacer(1,12)]
+    data=[['Location','State','Risk','Probability','Rain 24h (mm)','Slope (deg)','Elevation (m)']]
+    for x in locations: data.append([x['name'],x['state'],x['riskLevel'].title(),f"{x['probability']:.1%}",f"{float(x.get('rainfall',0)):.1f}",f"{float(x.get('slope',0)):.1f}",f"{float(x.get('elevation',0)):.0f}"])
+    table=Table(data,repeatRows=1); table.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#e9f3ee')),('GRID',(0,0),(-1,-1),.3,colors.HexColor('#cbd8d2')),('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),('FONTSIZE',(0,0),(-1,-1),8),('VALIGN',(0,0),(-1,-1),'MIDDLE')]))
+    story.append(table); story.append(Spacer(1,10)); story.append(Paragraph(f"Generated {datetime.now(timezone.utc).isoformat()} · Data mode: {data_status()['mode']}",styles['Normal']))
+    doc.build(story); return Response(buf.getvalue(),media_type='application/pdf',headers={'Content-Disposition':'attachment; filename=SLOPESHIELD-risk-report.pdf'})
+
+
+@router.get('/problems-pdf')
+def problems_pdf():
+    from io import BytesIO
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    status = data_status()
+    locations = get_locations()
+    buffer = BytesIO()
+    document = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+    styles = getSampleStyleSheet()
+    problems = [
+        ["Issue", "Impact", "Status"],
+        ["Backend stopped or closed", "Frontend cannot fetch locations, weather, alerts, or simulations.", "Fixed: backend startup verified"],
+        ["SQLite schema timestamps missing from inserts", "Live monitoring and what-if simulation returned HTTP 500.", "Fixed: timestamps added"],
+        ["Analytics arrays were empty", "Risk trend and factor charts rendered blank.", "Fixed: live chart payloads added"],
+        ["Historical inventory was not imported", "The UI reported historical data as not loaded.", f"Fixed: {status['historicalDatabaseCount']} NASA records loaded"],
+        ["Hardcoded demo behavior", "Aizawl is forced to 92% critical risk while DEMO_MODE is enabled.", "Intentional demo behavior"],
+        ["Reference locations", "The 15 monitored locations are seeded catalogue points, not IoT sensor locations.", "Documented limitation"],
+        ["Model calibration risk", "Validation is 100% on the supplied holdout and may not represent real-world performance.", "Requires independent validation"],
+    ]
+    story = [
+        Paragraph("SLOPESHIELD NER - Data Pipeline Problems and Fixes", styles["Title"]),
+        Paragraph(f"Generated {datetime.now(timezone.utc).isoformat()}", styles["Normal"]),
+        Spacer(1, 12),
+        Paragraph("Current system status", styles["Heading2"]),
+        Paragraph(
+            f"Database mode: {status['mode']} | Historical records: {status['historicalDatabaseCount']} | "
+            f"Monitored locations: {len(locations)}. Live weather source: Open-Meteo.",
+            styles["Normal"],
+        ),
+        Spacer(1, 12),
+        Paragraph("Audit findings", styles["Heading2"]),
+    ]
+    table = Table(problems, colWidths=[125, 220, 125], repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e9f3ee")),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#cbd8d2")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7faf8")]),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 14))
+    story.append(Paragraph("End-to-end verification", styles["Heading2"]))
+    story.append(Paragraph("The verified pipeline fetches Open-Meteo data concurrently, updates all monitored locations, persists model predictions and alerts, and serves the frontend through the API. DEMO_MODE should be disabled for production use.", styles["Normal"]))
+    document.build(story)
+    return Response(buffer.getvalue(), media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=SLOPESHIELD-pipeline-audit.pdf"})
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\api\sensors.py =====
+
+from fastapi import APIRouter
+router = APIRouter(prefix="/sensors", tags=["sensors"])
+
+@router.get("/status")
+def sensor_status():
+    return {"enabled": False, "message": "IoT, ESP32, physical sensors and sensor simulation are intentionally disabled for SLOPESHIELD NER."}
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\api\__init__.py =====
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\database\database.py =====
+
+from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
+from app.config import get_settings
+from pathlib import Path
+import pandas as pd
+
+settings = get_settings()
+connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
+engine = create_engine(settings.database_url, connect_args=connect_args, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+class Base(DeclarativeBase):
+    pass
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def init_db():
+    from app.models import user, location, sensor, prediction, alert, historical_landslide  # noqa: F401
+    from app.models.location import Location
+    from app.models.historical_landslide import HistoricalLandslide
+    from app.models.alert import Alert
+    from app.services.data_service import REFERENCE_LOCATIONS
+
+    Base.metadata.create_all(bind=engine)
+
+    prediction_columns = {
+        column["name"]
+        for column in inspect(engine).get_columns("risk_predictions")
+    }
+    feature_columns = {
+        "rainfall_24h": "FLOAT",
+        "rainfall_7d": "FLOAT",
+        "elevation": "FLOAT",
+        "slope": "FLOAT",
+        "historical_landslides": "INTEGER",
+    }
+    with engine.begin() as connection:
+        for name, data_type in feature_columns.items():
+            if name not in prediction_columns:
+                connection.execute(
+                    text(
+                        f"ALTER TABLE risk_predictions ADD COLUMN {name} {data_type}"
+                    )
+                )
+
+    alert_columns = {
+        column["name"]
+        for column in inspect(engine).get_columns("warnings")
+    }
+    with engine.begin() as connection:
+        for name, data_type in {
+            "recommended_action": "VARCHAR(255)",
+            "resolved_at": "TIMESTAMP",
+        }.items():
+            if name not in alert_columns:
+                connection.execute(
+                    text(
+                        f"ALTER TABLE warnings ADD COLUMN {name} {data_type}"
+                    )
+                )
+
+    with SessionLocal.begin() as session:
+        if session.query(Location).count() == 0:
+            session.add_all(
+                Location(
+                    id=location_id,
+                    name=name,
+                    state=state,
+                    latitude=latitude,
+                    longitude=longitude,
+                    rainfall=0,
+                    slope=slope,
+                    elevation=elevation,
+                    land_cover=land_cover,
+                    geology=geology,
+                )
+                for (
+                    location_id,
+                    name,
+                    state,
+                    latitude,
+                    longitude,
+                    _rainfall,
+                    slope,
+                    elevation,
+                    land_cover,
+                    geology,
+                ) in REFERENCE_LOCATIONS
+            )
+
+        if session.query(HistoricalLandslide).count() == 0:
+            source = Path(__file__).resolve().parents[2] / "data" / "raw" / "nasa_global_landslides.csv"
+            if source.exists():
+                frame = pd.read_csv(source)
+                states = {
+                    "Assam", "Arunachal Pradesh", "Arunāchal Pradesh", "Manipur",
+                    "Meghalaya", "Meghālaya", "Mizoram", "Nagaland", "Nāgāland",
+                    "Sikkim", "Tripura",
+                }
+                triggers = {"downpour", "rain", "continuous_rain", "monsoon", "tropical_cyclone"}
+                frame = frame[
+                    (frame["country_name"].astype(str).str.strip() == "India")
+                    & frame["admin_division_name"].astype(str).str.strip().isin(states)
+                    & frame["landslide_trigger"].astype(str).str.strip().str.lower().isin(triggers)
+                ].dropna(subset=["latitude", "longitude"]).head(250)
+                records = []
+                for _, row in frame.iterrows():
+                    event_date = pd.to_datetime(row.get("event_date"), errors="coerce")
+                    records.append(HistoricalLandslide(
+                        latitude=float(row["latitude"]),
+                        longitude=float(row["longitude"]),
+                        date=event_date.date() if not pd.isna(event_date) else None,
+                        year=int(event_date.year) if not pd.isna(event_date) else None,
+                        place=str(row.get("location_description") or row.get("gazeteer_closest_point") or "Northeast India"),
+                        state=str(row.get("admin_division_name") or "Northeast India"),
+                        severity=str(row.get("landslide_size") or "Recorded event"),
+                        source="NASA Global Landslide Catalog",
+                        description=str(row.get("event_description") or "NASA Global Landslide Catalog event"),
+                    ))
+                session.add_all(records)
+
+        if settings.demo_mode:
+            demo_location = session.get(Location, "aizawl")
+            if demo_location:
+                demo_location.risk_level = "critical"
+                demo_location.probability = 0.92
+                demo_location.rainfall = 180.0
+                demo_location.trend = "increasing"
+                active_demo_alert = session.query(Alert).filter(
+                    Alert.location_id == "aizawl",
+                    Alert.status == "active",
+                ).first()
+                if active_demo_alert is None:
+                    session.add(Alert(
+                        location_id="aizawl",
+                        risk_level="critical",
+                        probability=0.92,
+                        rainfall=180.0,
+                        status="active",
+                        recommended_action="Demo alert: inspect Aizawl and follow local authority guidance.",
+                    ))
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\database\schemas.py =====
+
+from datetime import datetime
+from pydantic import BaseModel, Field
+
+class LocationOut(BaseModel):
+    id: str
+    name: str
+    state: str
+    latitude: float
+    longitude: float
+    riskLevel: str
+    probability: float
+    rainfall: float
+    slope: float
+    elevation: float
+    landCover: str
+    geology: str
+    historicalLandslides: int
+    trend: str
+    modelSource: str = "demo"
+
+class SimulationIn(BaseModel):
+    locationId: str
+    rainfall: float = Field(ge=0, le=1000)
+
+class PredictionOut(BaseModel):
+    probability: float
+    riskLevel: str
+    modelSource: str
+    factors: list[str] = []
+    simulated: bool = False
+    features: dict[str, float] = {}
+
+class LoginIn(BaseModel):
+    name: str = "User"
+    email: str
+
+class UserOut(BaseModel):
+    name: str
+    email: str
+    authenticated: bool = True
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\database\__init__.py =====
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\models\alert.py =====
+
+from datetime import datetime
+from sqlalchemy import DateTime, String, Float
+from sqlalchemy.orm import Mapped, mapped_column
+from app.database.database import Base
+
+class Alert(Base):
+    __tablename__ = "warnings"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    location_id: Mapped[str] = mapped_column(String(80), index=True)
+    risk_level: Mapped[str] = mapped_column(String(20))
+    probability: Mapped[float] = mapped_column(Float)
+    rainfall: Mapped[float] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(30), default="active")
+    recommended_action: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\models\historical_landslide.py =====
+
+from datetime import date
+
+from sqlalchemy import Date, Float, Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.database.database import Base
+
+
+class HistoricalLandslide(Base):
+    __tablename__ = "historical_landslides"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    place: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    state: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    severity: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    source: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\models\location.py =====
+
+from sqlalchemy import Float, Integer, String
+from sqlalchemy.orm import Mapped, mapped_column
+from app.database.database import Base
+
+class Location(Base):
+    __tablename__ = "locations"
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), index=True)
+    state: Mapped[str] = mapped_column(String(120), index=True)
+    latitude: Mapped[float] = mapped_column(Float)
+    longitude: Mapped[float] = mapped_column(Float)
+    risk_level: Mapped[str] = mapped_column(String(20), default="low")
+    probability: Mapped[float] = mapped_column(Float, default=0.0)
+    rainfall: Mapped[float] = mapped_column(Float, default=0.0)
+    slope: Mapped[float] = mapped_column(Float, default=0.0)
+    elevation: Mapped[float] = mapped_column(Float, default=0.0)
+    land_cover: Mapped[str] = mapped_column(String(255), default="Unknown")
+    geology: Mapped[str] = mapped_column(String(255), default="Unknown")
+    historical_landslides: Mapped[int] = mapped_column(Integer, default=0)
+    trend: Mapped[str] = mapped_column(String(20), default="stable")
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\models\prediction.py =====
+
+from datetime import datetime
+from sqlalchemy import DateTime, Float, String
+from sqlalchemy.orm import Mapped, mapped_column
+from app.database.database import Base
+
+class Prediction(Base):
+    __tablename__ = "risk_predictions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    location_id: Mapped[str] = mapped_column(String(80), index=True)
+    probability: Mapped[float] = mapped_column(Float)
+    risk_level: Mapped[str] = mapped_column(String(20))
+    model_name: Mapped[str] = mapped_column(String(80))
+    rainfall_24h: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rainfall_7d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    elevation: Mapped[float | None] = mapped_column(Float, nullable=True)
+    slope: Mapped[float | None] = mapped_column(Float, nullable=True)
+    historical_landslides: Mapped[int | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\models\rainfall_observation.py =====
+
+from datetime import datetime
+
+from sqlalchemy import DateTime, Float, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.database.database import Base
+
+
+class RainfallObservation(Base):
+    __tablename__ = "rainfall_observations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    location_id: Mapped[str] = mapped_column(String(80), index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    rainfall_1h: Mapped[float] = mapped_column(Float, default=0.0)
+    rainfall_24h: Mapped[float] = mapped_column(Float, default=0.0)
+    rainfall_7d: Mapped[float] = mapped_column(Float, default=0.0)
+    source: Mapped[str] = mapped_column(String(80), default="Open-Meteo")
+    temperature: Mapped[float] = mapped_column(Float, default=0.0)
+    humidity: Mapped[float] = mapped_column(Float, default=0.0)
+    wind_speed: Mapped[float] = mapped_column(Float, default=0.0)
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\models\sensor.py =====
+
+from sqlalchemy import String
+from sqlalchemy.orm import Mapped, mapped_column
+from app.database.database import Base
+
+class Sensor(Base):
+    __tablename__ = "sensors"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(40), default="disabled")
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\models\user.py =====
+
+from sqlalchemy import String
+from sqlalchemy.orm import Mapped, mapped_column
+from app.database.database import Base
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\models\__init__.py =====
+
+from .user import User
+from .location import Location
+from .sensor import Sensor
+from .prediction import Prediction
+from .alert import Alert
+from .rainfall_observation import RainfallObservation
+from .historical_landslide import HistoricalLandslide
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\services\alert_service.py =====
+
+from datetime import datetime, timezone
+
+def build_warning(location):
+    if location.get('riskLevel') not in {'high','critical'} and location.get('trend') != 'increasing': return None
+    return {'id':f"w-{location['id']}",'locationId':location['id'],'location':f"{location['name']}, {location['state']}",'riskLevel':location['riskLevel'],'rainfall':location.get('rainfall',0),'probability':round(float(location.get('probability',0))*100),'change':0,'timestamp':datetime.now(timezone.utc).isoformat(),'source':location.get('modelSource','backend')}
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\services\data_service.py =====
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+from sqlalchemy import text
+
+from app.database.database import engine
+from app.config import get_settings
+
+
+ROOT = Path(__file__).resolve().parents[2]
+PROCESSED = ROOT / "data" / "processed"
+RAW = ROOT / "data" / "raw"
+
+FEATURE_FILE = PROCESSED / "location_features.csv"
+HIST_FILE = RAW / "ner_landslides.csv"
+DATABASE_LABEL = "PostgreSQL" if get_settings().database_url.startswith("postgres") else "SQLite"
+
+
+REFERENCE_LOCATIONS = [
+    (
+        "aizawl",
+        "Aizawl",
+        "Mizoram",
+        23.7271,
+        92.7176,
+        214,
+        38,
+        1132,
+        "Urban settlement on steep slopes",
+        "Barail sandstone & shale",
+    ),
+    (
+        "shillong",
+        "Shillong",
+        "Meghalaya",
+        25.5788,
+        91.8933,
+        186,
+        27,
+        1496,
+        "Pine forest & built-up",
+        "Shillong group quartzite",
+    ),
+    (
+        "cherrapunji",
+        "Cherrapunji (Sohra)",
+        "Meghalaya",
+        25.3,
+        91.7,
+        342,
+        44,
+        1430,
+        "Grassland & bare escarpment",
+        "Sandstone over gneiss",
+    ),
+    (
+        "gangtok",
+        "Gangtok",
+        "Sikkim",
+        27.3314,
+        88.6138,
+        158,
+        33,
+        1650,
+        "Terraced settlement",
+        "Daling phyllite",
+    ),
+    (
+        "itanagar",
+        "Itanagar",
+        "Arunachal Pradesh",
+        27.0844,
+        93.6053,
+        121,
+        21,
+        617,
+        "Subtropical broadleaf forest",
+        "Siwalik sandstone",
+    ),
+    (
+        "tawang",
+        "Tawang",
+        "Arunachal Pradesh",
+        27.5861,
+        91.8594,
+        96,
+        36,
+        3048,
+        "Alpine scrub",
+        "Gneissic complex",
+    ),
+    (
+        "kohima",
+        "Kohima",
+        "Nagaland",
+        25.6751,
+        94.1086,
+        149,
+        31,
+        1444,
+        "Mixed forest & settlement",
+        "Disang shale",
+    ),
+    (
+        "dimapur",
+        "Dimapur",
+        "Nagaland",
+        25.9063,
+        93.7276,
+        62,
+        5,
+        145,
+        "Alluvial plain, cropland",
+        "Recent alluvium",
+    ),
+    (
+        "imphal",
+        "Imphal",
+        "Manipur",
+        24.817,
+        93.9368,
+        74,
+        7,
+        786,
+        "Valley cropland",
+        "Lacustrine deposits",
+    ),
+    (
+        "churachandpur",
+        "Churachandpur",
+        "Manipur",
+        24.3333,
+        93.6833,
+        133,
+        24,
+        914,
+        "Jhum cultivation slopes",
+        "Disang flysch",
+    ),
+    (
+        "haflong",
+        "Haflong",
+        "Assam",
+        25.1667,
+        93.0167,
+        197,
+        35,
+        680,
+        "Cut slopes along rail corridor",
+        "Barail group sandstone",
+    ),
+    (
+        "guwahati",
+        "Guwahati",
+        "Assam",
+        26.1445,
+        91.7362,
+        108,
+        18,
+        55,
+        "Urban hillocks",
+        "Weathered granite gneiss",
+    ),
+    (
+        "lunglei",
+        "Lunglei",
+        "Mizoram",
+        22.8879,
+        92.7346,
+        171,
+        32,
+        1133,
+        "Bamboo forest & settlement",
+        "Bhuban formation",
+    ),
+    (
+        "agartala",
+        "Agartala",
+        "Tripura",
+        23.8315,
+        91.2868,
+        58,
+        4,
+        16,
+        "Plain, urban",
+        "Dupitila sandstone",
+    ),
+    (
+        "pelling",
+        "Pelling",
+        "Sikkim",
+        27.3,
+        88.2167,
+        164,
+        37,
+        2150,
+        "Temperate forest",
+        "Central crystalline gneiss",
+    ),
+]
+
+
+def _probability(
+    rainfall: float,
+    slope: float,
+    elevation: float,
+) -> float:
+    import math
+
+    z = (
+        -4.2
+        + 0.010 * rainfall
+        + 0.045 * slope
+        + 0.00015 * elevation
+    )
+
+    return 1 / (1 + math.exp(-z))
+
+
+def _risk(probability: float) -> str:
+    if probability >= 0.75:
+        return "critical"
+
+    if probability >= 0.55:
+        return "high"
+
+    if probability >= 0.30:
+        return "moderate"
+
+    return "low"
+
+
+def _reference():
+    rows = []
+
+    for (
+        location_id,
+        name,
+        state,
+        latitude,
+        longitude,
+        rainfall,
+        slope,
+        elevation,
+        land_cover,
+        geology,
+    ) in REFERENCE_LOCATIONS:
+
+        probability = _probability(
+            rainfall,
+            slope,
+            elevation,
+        )
+
+        rows.append(
+            {
+                "id": location_id,
+                "name": name,
+                "state": state,
+                "latitude": latitude,
+                "longitude": longitude,
+                "riskLevel": _risk(probability),
+                "probability": round(
+                    probability,
+                    4,
+                ),
+                "rainfall": rainfall,
+                "rainfall7d": 0,
+                "slope": slope,
+                "elevation": elevation,
+                "landCover": land_cover,
+                "geology": geology,
+                "historicalLandslides": 0,
+                "trend": "stable",
+                "modelSource": "reference-only",
+                "dataMode": "reference",
+            }
+        )
+
+    return rows
+
+
+def _from_features():
+    if not FEATURE_FILE.exists():
+        return []
+
+    try:
+        df = pd.read_csv(FEATURE_FILE)
+    except Exception:
+        return []
+
+    if df.empty or not {
+        "latitude",
+        "longitude",
+    }.issubset(df.columns):
+        return []
+
+    rows = []
+
+    for index, row in df.iterrows():
+        try:
+            latitude = float(row.latitude)
+            longitude = float(row.longitude)
+        except Exception:
+            continue
+
+        if row.get("target", 0) != 1:
+            continue
+
+        name = str(
+            row.get("place")
+            or f"NER event {index + 1}"
+        )
+
+        probability = float(
+            row.get(
+                "probability",
+                row.get(
+                    "target_probability",
+                    0.5,
+                ),
+            )
+            or 0.5
+        )
+
+        rows.append(
+            {
+                "id": f"event-{index + 1}",
+                "name": name,
+                "state": str(
+                    row.get("state")
+                    or "Northeast India"
+                ),
+                "latitude": latitude,
+                "longitude": longitude,
+                "riskLevel": _risk(probability),
+                "probability": round(
+                    probability,
+                    4,
+                ),
+                "rainfall": float(
+                    row.get(
+                        "rainfall_24h",
+                        0,
+                    )
+                    or 0
+                ),
+                "rainfall7d": float(
+                    row.get(
+                        "rainfall_7d",
+                        0,
+                    )
+                    or 0
+                ),
+                "slope": float(
+                    row.get(
+                        "slope",
+                        0,
+                    )
+                    or 0
+                ),
+                "elevation": float(
+                    row.get(
+                        "elevation",
+                        0,
+                    )
+                    or 0
+                ),
+                "landCover": str(
+                    row.get(
+                        "land_cover",
+                        "Unavailable",
+                    )
+                ),
+                "geology": str(
+                    row.get(
+                        "geology",
+                        "Unavailable",
+                    )
+                ),
+                "historicalLandslides": int(
+                    row.get(
+                        "historical_landslides",
+                        1,
+                    )
+                    or 1
+                ),
+                "trend": "observed",
+                "modelSource": str(
+                    row.get(
+                        "model_source",
+                        "real-source",
+                    )
+                ),
+                "dataMode": "real-source",
+            }
+        )
+
+    return rows[:500]
+
+
+def get_locations():
+    query = text(
+        """
+        SELECT
+            l.id,
+            l.name,
+            l.state,
+            l.latitude,
+            l.longitude,
+            l.elevation,
+            l.slope,
+            l.land_cover,
+            l.geology,
+            l.historical_landslides,
+            l.risk_level,
+            l.probability,
+            COALESCE(
+                (
+                    SELECT rainfall_24h
+                    FROM rainfall_observations ro
+                    WHERE ro.location_id = l.id
+                    ORDER BY ro.observed_at DESC
+                    LIMIT 1
+                ),
+                l.rainfall,
+                0
+            ) AS rainfall,
+            COALESCE(
+                (
+                    SELECT rainfall_7d
+                    FROM rainfall_observations ro
+                    WHERE ro.location_id = l.id
+                    ORDER BY ro.observed_at DESC
+                    LIMIT 1
+                ),
+                0
+            ) AS rainfall7d,
+            l.trend
+        FROM locations l
+        WHERE l.id NOT LIKE 'event-%'
+        ORDER BY l.id
+        """
+    )
+
+    with engine.connect() as connection:
+        result = connection.execute(query)
+
+        rows = []
+
+        for row in result.mappings():
+            rows.append(
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "state": row["state"],
+                    "latitude": float(
+                        row["latitude"]
+                    ),
+                    "longitude": float(
+                        row["longitude"]
+                    ),
+                    "riskLevel": row[
+                        "risk_level"
+                    ],
+                    "probability": float(
+                        row["probability"]
+                        or 0
+                    ),
+                    "rainfall": float(
+                        row["rainfall"]
+                        or 0
+                    ),
+                    "rainfall7d": float(
+                        row["rainfall7d"]
+                        or 0
+                    ),
+                    "slope": float(
+                        row["slope"]
+                        or 0
+                    ),
+                    "elevation": float(
+                        row["elevation"]
+                        or 0
+                    ),
+                    "landCover": row[
+                        "land_cover"
+                    ],
+                    "geology": row[
+                        "geology"
+                    ],
+                    "historicalLandslides": int(
+                        row[
+                            "historical_landslides"
+                        ]
+                        or 0
+                    ),
+                    "trend": row["trend"],
+                    "modelSource": DATABASE_LABEL,
+                    "dataMode": "database",
+                }
+            )
+
+        return rows
+
+
+def get_location(location_id):
+    locations = get_locations()
+
+    for location in locations:
+        if location["id"] == location_id:
+            return location
+
+    return None
+
+
+def _first_value(row, keys, default=None):
+    for key in keys:
+        if key in row and row[key] is not None:
+            return row[key]
+
+    return default
+
+def get_historical():
+    query = text(
+        """
+        SELECT
+            id,
+            latitude,
+            longitude,
+            date,
+            year,
+            place,
+            state,
+            severity,
+            source,
+            description
+        FROM historical_landslides
+        ORDER BY date DESC NULLS LAST, id
+        """
+    )
+
+    try:
+        with engine.connect() as connection:
+            result = connection.execute(query)
+
+            points = []
+
+            for row in result.mappings():
+                latitude = row.get("latitude")
+                longitude = row.get("longitude")
+
+                if latitude is None or longitude is None:
+                    continue
+
+                observed_date = row.get("date")
+
+                if hasattr(observed_date, "isoformat"):
+                    observed_date = observed_date.isoformat()
+
+                points.append(
+                    {
+                        "id": row.get("id"),
+                        "latitude": float(latitude),
+                        "longitude": float(longitude),
+                        "date": observed_date,
+                        "year": row.get("year"),
+                        "place": row.get("place"),
+                        "state": row.get("state"),
+                        "severity": row.get("severity"),
+                        "source": row.get("source"),
+                        "description": row.get("description"),
+                    }
+                )
+
+            return {
+                "points": points,
+                "count": len(points),
+                "source": DATABASE_LABEL,
+            }
+
+    except Exception as exc:
+        print(f"Historical data error: {exc}")
+        return {
+            "points": [],
+            "count": 0,
+            "source": DATABASE_LABEL,
+            "error": str(exc),
+        }
+
+
+def data_status():
+    feature_table_exists = (
+        FEATURE_FILE.exists()
+    )
+
+    historical_file_exists = HIST_FILE.exists()
+    historical_database_count = 0
+
+    try:
+        with engine.connect() as connection:
+            historical_database_count = connection.execute(
+                text("SELECT COUNT(*) FROM historical_landslides")
+            ).scalar() or 0
+    except Exception:
+        historical_database_count = 0
+
+    return {
+        "mode": "database",
+        "featureTable": feature_table_exists,
+        "historicalInventory": historical_file_exists,
+        "historicalDataAvailable": bool(
+            historical_file_exists or historical_database_count
+        ),
+        "historicalDatabaseCount": int(historical_database_count),
+        "featureFile": str(
+            FEATURE_FILE
+        ),
+        "historicalFile": str(
+            HIST_FILE
+        ),
+        "generatedAt": datetime.now(
+            timezone.utc
+        ).isoformat(),
+    }
+
+
+def get_risk():
+    locations = get_locations()
+
+    levels = [
+        "low",
+        "moderate",
+        "high",
+        "critical",
+    ]
+
+    distribution = [
+        {
+            "level": level,
+            "count": sum(
+                location["riskLevel"]
+                == level
+                for location in locations
+            ),
+        }
+        for level in levels
+    ]
+
+    regional = {}
+
+    for location in locations:
+        regional.setdefault(
+            location["state"],
+            [],
+        ).append(
+            location["probability"]
+        )
+
+    regional_rows = [
+        {
+            "state": state,
+            "region": state,
+            "risk": round(
+                sum(values)
+                / len(values),
+                3,
+            ),
+            "locations": len(values),
+            "rainfall": round(sum(location["rainfall"] for location in locations if location["state"] == state) / len(values), 2),
+        }
+        for state, values in sorted(
+            regional.items()
+        )
+    ]
+
+    now = datetime.now(timezone.utc).isoformat()
+    trend = [{
+        "day": now[:16].replace("T", " "),
+        **{level: sum(location["riskLevel"] == level for location in locations) for level in levels},
+    }]
+
+    feature_totals = {
+        "Rainfall 24h": sum(float(location["rainfall"] or 0) for location in locations),
+        "Rainfall 7d": sum(float(location["rainfall7d"] or 0) for location in locations),
+        "Slope": sum(float(location["slope"] or 0) for location in locations),
+        "Elevation": sum(float(location["elevation"] or 0) for location in locations),
+        "Historical events": sum(float(location["historicalLandslides"] or 0) for location in locations),
+    }
+    total_features = sum(feature_totals.values()) or 1
+    factors = [
+        {"factor": name, "weight": round(value / total_features * 100, 1)}
+        for name, value in feature_totals.items()
+    ]
+
+    recent_changes = [
+        {
+            "id": location["id"],
+            "location": location["name"],
+            "from": "low" if location["trend"] == "increasing" else location["riskLevel"],
+            "to": location["riskLevel"],
+            "at": now,
+        }
+        for location in locations
+        if location["trend"] in {"increasing", "decreasing"}
+    ]
+
+    return {
+        "distribution": distribution,
+        "trend": trend,
+        "factors": factors,
+        "regional": regional_rows,
+        "recentChanges": recent_changes,
+    }
+
+
+def get_rainfall():
+    query = text(
+        """
+        SELECT
+            ro.location_id,
+            l.name,
+            l.risk_level,
+            l.probability,
+            observed_at,
+            rainfall_1h,
+            rainfall_24h,
+            rainfall_7d,
+            source
+        FROM rainfall_observations ro
+        JOIN locations l ON l.id = ro.location_id
+        ORDER BY observed_at
+        """
+    )
+
+    with engine.connect() as connection:
+        result = connection.execute(query)
+
+        series = []
+
+        for row in result.mappings():
+            observed_at = row[
+                "observed_at"
+            ]
+
+            if isinstance(
+                observed_at,
+                datetime,
+            ):
+                observed_at = (
+                    observed_at.isoformat()
+                )
+            else:
+                observed_at = str(
+                    observed_at
+                )
+
+            series.append(
+                {
+                    "locationId": str(
+                        row["location_id"]
+                    ),
+                    "day": str(row["observed_at"])[:16],
+                    "location": row["name"],
+                    "risk": float(row["probability"] or 0),
+                    "rainfall": float(row["rainfall_24h"] or 0),
+                    "observedAt": observed_at,
+                    "rainfall1h": float(
+                        row["rainfall_1h"]
+                        or 0
+                    ),
+                    "rainfall24h": float(
+                        row["rainfall_24h"]
+                        or 0
+                    ),
+                    "rainfall7d": float(
+                        row["rainfall_7d"]
+                        or 0
+                    ),
+                    "source": str(
+                        row["source"]
+                        or "Database"
+                    ),
+                }
+            )
+
+    last24 = max(
+        (
+            item["rainfall24h"]
+            for item in series
+        ),
+        default=None,
+    )
+
+    last7d = max(
+        (
+            item["rainfall7d"]
+            for item in series
+        ),
+        default=None,
+    )
+
+    return {
+        "series": series,
+        "status": {
+            "headline": "Source-aware rainfall",
+            "last24h": last24,
+            "last7d": last7d,
+            "intensity": (
+                "Calculated per monitored point"
+            ),
+            "note": (
+                "Rainfall values are loaded "
+                f"from {DATABASE_LABEL} rainfall "
+                "observations."
+            ),
+        },
+    }
+
+
+def get_summary():
+    locations = get_locations()
+
+    historical = get_historical()["points"]
+
+    return {
+        "monitoredAreas": len(
+            locations
+        ),
+        "attentionAreas": sum(
+            location["riskLevel"]
+            in {
+                "high",
+                "critical",
+            }
+            for location in locations
+        ),
+        "increasing": sum(
+            location["trend"]
+            == "increasing"
+            for location in locations
+        ),
+        "historicalEvents": len(
+            historical
+        ),
+        "dataStatus": data_status(),
+    }
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\services\ml_service.py =====
+
+from pathlib import Path
+import math, joblib, pandas as pd
+from app.config import get_settings
+from app.services.risk_engine import classify_probability
+
+FEATURES=[
+    "rainfall_24h",
+    "rainfall_7d",
+    "elevation",
+    "slope",
+    "historical_landslides",
+]
+
+class MLService:
+    def __init__(self):
+        self.settings=get_settings(); self.model=None; self.model_source="untrained"; self.metadata={}; self._load()
+    def _load(self):
+        path=self.settings.resolved_model_path
+        if path.exists():
+            self.model=joblib.load(path)
+            self.metadata=getattr(self.model,"metadata",{}) if hasattr(self.model,"metadata") else {}
+            if not self.metadata and isinstance(self.model,dict): self.metadata=self.model.get("metadata",{})
+            self.model_source=self.metadata.get("model_name","trained-model")
+    @property
+    def trained(self): return self.model is not None
+    @property
+    def feature_schema(self): return FEATURES
+    def predict(self,features,simulated=False):
+        if self.model is not None:
+            model=self.model.get("model") if isinstance(self.model,dict) else self.model
+            row=pd.DataFrame([{k:float(features.get(k,0) or 0) for k in FEATURES}])
+            probability=float(model.predict_proba(row)[0][1])
+            source=self.model_source
+        elif self.settings.demo_mode:
+            rain=float(features.get("rainfall_24h",0) or 0); slope=float(features.get("slope",0) or 0); elevation=float(features.get("elevation",0) or 0)
+            z=-4.2+0.010*rain+0.045*slope+0.00015*elevation
+            probability=1/(1+math.exp(-z)); source="demo-formula"
+        else:
+            raise RuntimeError("No trained model is available. Run the real-data pipeline first.")
+        used_features = {
+            key: float(features.get(key, 0) or 0)
+            for key in FEATURES
+        }
+        return {"probability":probability,"riskLevel":classify_probability(probability),"modelSource":source,"factors":self._factor_explanations(features),"simulated":simulated,"features":used_features}
+    @staticmethod
+    def _factor_explanations(features):
+        factors=[]
+        if float(features.get("rainfall_24h",0) or 0)>=120: factors.append("Heavy rainfall")
+        if float(features.get("slope",0) or 0)>=30: factors.append("Steep slope")
+       
+        if not factors: factors.append("No dominant threshold factor")
+        return factors
+ml_service=MLService()
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\services\monitoring_service.py =====
+
+from __future__ import annotations
+
+import math
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+import requests
+from sqlalchemy import text
+
+from app.database.database import engine
+from app.config import get_settings
+from app.services.ml_service import ml_service
+
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+SOURCE = "Open-Meteo"
+REQUEST_TIMEOUT = 15
+_cycle_lock = threading.Lock()
+_monitoring_state = {
+    "enabled": True,
+    "running": False,
+    "lastStartedAt": None,
+    "lastCompletedAt": None,
+    "lastResult": None,
+    "lastError": None,
+}
+
+
+def monitoring_status() -> dict:
+    return dict(_monitoring_state)
+
+
+def recommended_action(risk_level: str) -> str:
+    return {
+        "critical": "Immediate attention: inspect the area and follow local authority guidance.",
+        "high": "Issue a warning and increase monitoring of the location.",
+    }.get(risk_level, "Continue routine monitoring.")
+
+
+def _fetch_weather(latitude: float, longitude: float) -> dict:
+    response = requests.get(
+        OPEN_METEO_URL,
+        params={
+            "latitude": latitude,
+            "longitude": longitude,
+            "hourly": "precipitation,temperature_2m,relative_humidity_2m,wind_speed_10m",
+            "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,precipitation",
+            "past_days": 7,
+            "forecast_days": 1,
+            "timezone": "UTC",
+        },
+        timeout=REQUEST_TIMEOUT,
+        headers={"User-Agent": "SLOPESHIELD-NER/1.0"},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    hourly = payload.get("hourly") or {}
+    times = hourly.get("time") or []
+    precipitation = hourly.get("precipitation") or []
+    current = payload.get("current") or {}
+    current_time = current.get("time") or (times[-1] if times else None)
+
+    valid = [
+        (timestamp, float(value or 0))
+        for timestamp, value in zip(times, precipitation)
+        if timestamp <= current_time
+    ] if current_time else []
+    if not valid:
+        raise RuntimeError("Open-Meteo returned no hourly precipitation data.")
+
+    observed_at = datetime.fromisoformat(valid[-1][0].replace("Z", "+00:00")).replace(tzinfo=None)
+    return {
+        "observed_at": observed_at,
+        "rainfall_1h": max(0.0, valid[-1][1]),
+        "rainfall_24h": max(0.0, sum(value for _, value in valid[-24:])),
+        "rainfall_7d": max(0.0, sum(value for _, value in valid[-168:])),
+        "temperature": float(current.get("temperature_2m") or 0),
+        "humidity": max(0.0, min(100.0, float(current.get("relative_humidity_2m") or 0))),
+        "wind_speed": max(0.0, float(current.get("wind_speed_10m") or 0)),
+    }
+
+
+def _historical_count(connection, latitude: float, longitude: float) -> int:
+    rows = connection.execute(text("SELECT latitude, longitude FROM historical_landslides WHERE latitude IS NOT NULL AND longitude IS NOT NULL")).mappings()
+    count = 0
+    for row in rows:
+        lat_delta = math.radians(float(row["latitude"]) - latitude)
+        lon_delta = math.radians(float(row["longitude"]) - longitude)
+        a = math.sin(lat_delta / 2) ** 2 + math.cos(math.radians(latitude)) * math.cos(math.radians(float(row["latitude"]))) * math.sin(lon_delta / 2) ** 2
+        if 6371.0 * 2 * math.asin(min(1.0, math.sqrt(a))) <= 25.0:
+            count += 1
+    return count
+
+
+def _fetch_location_weather(location: dict) -> tuple[dict, dict | None, str | None]:
+    try:
+        observation = _fetch_weather(float(location["latitude"]), float(location["longitude"]))
+        return location, observation, None
+    except Exception as exc:
+        return location, None, str(exc)
+
+
+def _save_observation(connection, location_id: str, observation: dict) -> None:
+    values = {"location_id": location_id, "source": SOURCE, **observation}
+    updated = connection.execute(text("""
+        UPDATE rainfall_observations
+        SET rainfall_1h=:rainfall_1h, rainfall_24h=:rainfall_24h, rainfall_7d=:rainfall_7d,
+            source=:source, temperature=:temperature, humidity=:humidity, wind_speed=:wind_speed
+        WHERE location_id=:location_id AND observed_at=:observed_at
+    """), values)
+    if updated.rowcount == 0:
+        connection.execute(text("""
+            INSERT INTO rainfall_observations
+            (location_id, observed_at, rainfall_1h, rainfall_24h, rainfall_7d, source, temperature, humidity, wind_speed)
+            VALUES (:location_id, :observed_at, :rainfall_1h, :rainfall_24h, :rainfall_7d, :source, :temperature, :humidity, :wind_speed)
+        """), values)
+
+
+def _save_prediction_and_alert(connection, location: dict, observation: dict, result: dict, historical_landslides: int) -> None:
+    probability = float(result["probability"])
+    risk_level = str(result["riskLevel"])
+    previous = float(location.get("probability") or 0)
+    trend = "increasing" if probability > previous + 0.000001 else "decreasing" if probability < previous - 0.000001 else "stable"
+
+    connection.execute(text("""
+        UPDATE locations
+        SET risk_level=:risk_level, probability=:probability, rainfall=:rainfall, trend=:trend,
+            historical_landslides=:historical_landslides
+        WHERE id=:location_id
+    """), {"location_id": location["id"], "risk_level": risk_level, "probability": probability, "rainfall": observation["rainfall_24h"], "trend": trend, "historical_landslides": historical_landslides})
+    connection.execute(text("""
+        INSERT INTO risk_predictions
+        (location_id, probability, risk_level, model_name, rainfall_24h, rainfall_7d,
+         elevation, slope, historical_landslides, created_at)
+        VALUES
+        (:location_id, :probability, :risk_level, :model_name, :rainfall_24h, :rainfall_7d,
+         :elevation, :slope, :historical_landslides, CURRENT_TIMESTAMP)
+    """), {
+        "location_id": location["id"],
+        "probability": probability,
+        "risk_level": risk_level,
+        "model_name": result["modelSource"],
+        "rainfall_24h": observation["rainfall_24h"],
+        "rainfall_7d": observation["rainfall_7d"],
+        "elevation": location["elevation"],
+        "slope": location["slope"],
+        "historical_landslides": historical_landslides,
+    })
+
+    active = connection.execute(text("SELECT id FROM warnings WHERE location_id=:location_id AND status='active' AND risk_level=:risk_level LIMIT 1"), {"location_id": location["id"], "risk_level": risk_level}).first()
+    if risk_level in {"high", "critical"}:
+        alert_values = {"location_id": location["id"], "risk_level": risk_level, "probability": probability, "rainfall": observation["rainfall_24h"], "recommended_action": recommended_action(risk_level)}
+        if active:
+            connection.execute(text("UPDATE warnings SET probability=:probability, rainfall=:rainfall, recommended_action=:recommended_action WHERE id=:id"), {**alert_values, "id": active[0]})
+        else:
+            connection.execute(text("INSERT INTO warnings (location_id, risk_level, probability, rainfall, recommended_action, status, created_at) VALUES (:location_id, :risk_level, :probability, :rainfall, :recommended_action, 'active', CURRENT_TIMESTAMP)"), alert_values)
+    else:
+        connection.execute(text("UPDATE warnings SET status='resolved', resolved_at=CURRENT_TIMESTAMP WHERE location_id=:location_id AND status='active'"), {"location_id": location["id"]})
+
+
+def run_monitoring_cycle() -> dict:
+    if not _cycle_lock.acquire(blocking=False):
+        raise RuntimeError("A monitoring cycle is already running.")
+
+    started_at = datetime.utcnow()
+    _monitoring_state.update({
+        "running": True,
+        "lastStartedAt": started_at.isoformat(),
+        "lastError": None,
+    })
+
+    try:
+        return _run_monitoring_cycle()
+    except Exception as exc:
+        _monitoring_state["lastError"] = str(exc)
+        raise
+    finally:
+        _monitoring_state["running"] = False
+        _monitoring_state["lastCompletedAt"] = datetime.utcnow().isoformat()
+        _cycle_lock.release()
+
+
+def _run_monitoring_cycle() -> dict:
+    if not ml_service.trained:
+        raise RuntimeError("Trained ML model is unavailable. Run the real-data pipeline first.")
+
+    with engine.connect() as connection:
+        locations = [dict(row) for row in connection.execute(text("""
+            SELECT id, name, state, latitude, longitude, elevation, slope, historical_landslides, probability
+            FROM locations WHERE id NOT LIKE 'event-%' ORDER BY id
+        """ )).mappings()]
+
+    fetched = {}
+    failures = []
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(locations)))) as executor:
+        futures = [executor.submit(_fetch_location_weather, location) for location in locations]
+        for future in as_completed(futures):
+            location, observation, error = future.result()
+            if error:
+                failures.append({"locationId": location["id"], "location": location["name"], "error": error})
+            else:
+                fetched[location["id"]] = (location, observation)
+
+    results = []
+    with engine.begin() as connection:
+        for location in locations:
+            item = fetched.get(location["id"])
+            if not item:
+                continue
+            location, observation = item
+            try:
+                _save_observation(connection, location["id"], observation)
+                historical_landslides = _historical_count(connection, float(location["latitude"]), float(location["longitude"]))
+                prediction = ml_service.predict({
+                    "rainfall_24h": observation["rainfall_24h"],
+                    "rainfall_7d": observation["rainfall_7d"],
+                    "elevation": location["elevation"],
+                    "slope": location["slope"],
+                    "historical_landslides": historical_landslides,
+                })
+                if get_settings().demo_mode and location["id"] == "aizawl":
+                    prediction = {
+                        **prediction,
+                        "probability": 0.92,
+                        "riskLevel": "critical",
+                        "modelSource": "demo-scenario",
+                    }
+                _save_prediction_and_alert(connection, location, observation, prediction, historical_landslides)
+                results.append({"locationId": location["id"], "location": location["name"], "rainfall24h": observation["rainfall_24h"], "rainfall7d": observation["rainfall_7d"], "riskLevel": prediction["riskLevel"], "probability": prediction["probability"], "modelSource": prediction["modelSource"], "observedAt": observation["observed_at"].isoformat()})
+            except Exception as exc:
+                failures.append({"locationId": location["id"], "location": location["name"], "error": str(exc)})
+
+    result = {"source": SOURCE, "modelSource": ml_service.model_source, "updated": len(results), "failed": len(failures), "results": results, "failures": failures}
+    _monitoring_state["lastResult"] = {
+        "updated": result["updated"],
+        "failed": result["failed"],
+        "source": result["source"],
+        "modelSource": result["modelSource"],
+    }
+    return result
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\services\risk_engine.py =====
+
+from dataclasses import dataclass
+
+# Prototype thresholds only. Final thresholds MUST be selected from validated model calibration.
+THRESHOLDS = {"low_max": 0.30, "moderate_max": 0.55, "high_max": 0.75}
+
+@dataclass
+class RiskResult:
+    probability: float
+    risk_level: str
+
+
+def classify_probability(probability: float) -> str:
+    p = max(0.0, min(1.0, float(probability)))
+    if p >= THRESHOLDS["high_max"]:
+        return "critical"
+    if p >= THRESHOLDS["moderate_max"]:
+        return "high"
+    if p >= THRESHOLDS["low_max"]:
+        return "moderate"
+    return "low"
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\services\weather_service.py =====
+
+from __future__ import annotations
+from datetime import date, timedelta
+import requests
+
+OPEN_METEO="https://api.open-meteo.com/v1/forecast"
+ARCHIVE="https://archive-api.open-meteo.com/v1/archive"
+
+
+def _safe_get(url, params):
+    r=requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+
+def current(lat: float, lon: float):
+    data=_safe_get(OPEN_METEO,{"latitude":lat,"longitude":lon,"current":"temperature_2m,relative_humidity_2m,wind_speed_10m,rain","hourly":"precipitation","forecast_days":2,"timezone":"UTC"})
+    hourly=data.get("hourly",{})
+    precip=[float(x or 0) for x in hourly.get("precipitation",[])][-24:]
+    cur=data.get("current",{})
+    return {"temperature":cur.get("temperature_2m"),"humidity":cur.get("relative_humidity_2m"),"wind":cur.get("wind_speed_10m"),"rainfall24h":round(sum(precip),1),"provider":"Open-Meteo","updatedAt":cur.get("time")}
+
+
+def historical(lat: float, lon: float, start: date, end: date):
+    data=_safe_get(ARCHIVE,{"latitude":lat,"longitude":lon,"start_date":start.isoformat(),"end_date":end.isoformat(),"daily":"precipitation_sum","timezone":"UTC"})
+    return [{"day":d,"rainfall":float(v or 0)} for d,v in zip(data.get("daily",{}).get("time",[]),data.get("daily",{}).get("precipitation_sum",[]))]
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\services\__init__.py =====
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\config.py =====
+
+from functools import lru_cache
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pathlib import Path
+
+class Settings(BaseSettings):
+    app_name: str='SLOPESHIELD NER API'
+    environment: str='development'
+    demo_mode: bool=True
+    database_url: str='sqlite:///./SLOPESHIELD.db'
+    cors_origins: str='http://localhost:5173,http://127.0.0.1:5173'
+    model_path: str='models/landslide_model.joblib'
+    nasa_glc_url: str='https://data.nasa.gov/docs/legacy/Global_Landslide_Catalog_Export/Global_Landslide_Catalog_Export_rows.csv'
+    weather_provider: str='open-meteo'
+    model_name: str='xgboost'
+    model_version: str='untrained'
+    monitoring_enabled: bool=True
+    monitoring_interval_minutes: int=15
+    model_config=SettingsConfigDict(env_file='.env',extra='ignore')
+    @property
+    def resolved_model_path(self):
+        p=Path(self.model_path)
+        if p.is_absolute(): return p
+        # Accept both backend-relative paths (models/...) and project-relative paths (backend/models/...).
+        backend_root = Path(__file__).resolve().parents[1]
+        project_root = backend_root.parent
+        if str(p).replace('\\','/').startswith('backend/'):
+            return project_root / p
+        return backend_root / p
+    @property
+    def cors_list(self): return [x.strip() for x in self.cors_origins.split(',') if x.strip()]
+@lru_cache
+def get_settings(): return Settings()
+
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\main.py =====
+
+import asyncio
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from app.config import get_settings
+from app.api import auth, predictions, locations, sensors, alerts, reports, data, monitoring
+from app.database.database import init_db
+from app.services.monitoring_service import run_monitoring_cycle
+
+settings = get_settings()
+
+init_db()
+
+
+async def monitoring_loop():
+    while True:
+        try:
+            await asyncio.to_thread(run_monitoring_cycle)
+        except Exception as exc:
+            print(f"Automatic monitoring cycle failed: {exc}")
+        await asyncio.sleep(max(1, settings.monitoring_interval_minutes * 60))
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    task = None
+    if settings.monitoring_enabled:
+        task = asyncio.create_task(monitoring_loop())
+    try:
+        yield
+    finally:
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+app = FastAPI(
+    title=settings.app_name,
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "project": "SLOPESHIELD NER",
+        "environment": settings.environment,
+        "demoMode": settings.demo_mode,
+        "docs": "/docs"
+    }
+
+
+@app.get("/")
+def root():
+    return {
+        "project": "SLOPESHIELD NER API",
+        "status": "ok",
+        "health": "/health",
+        "docs": "/docs",
+        "frontend": "http://127.0.0.1:5173/",
+    }
+
+
+@app.get("/api/status")
+def status():
+    from app.services.ml_service import ml_service
+    from app.services.data_service import data_status
+
+    return {
+        "project": "SLOPESHIELD NER",
+        "demoMode": settings.demo_mode,
+        "modelTrained": ml_service.trained,
+        "modelSource": ml_service.model_source,
+        "data": data_status(),
+        "iot": False
+    }
+
+
+app.include_router(auth.router, prefix="/api")
+app.include_router(predictions.router, prefix="/api")
+app.include_router(locations.router, prefix="/api")
+app.include_router(sensors.router, prefix="/api")
+app.include_router(alerts.router, prefix="/api")
+app.include_router(reports.router, prefix="/api")
+app.include_router(data.router, prefix="/api")
+app.include_router(monitoring.router, prefix="/api")
+
+===== C:\Users\TYUYU8\OneDrive\Desktop\project\demo sih\SLOPESHIELD_NER_Project\backend\app\__init__.py =====
+

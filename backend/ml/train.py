@@ -1,0 +1,45 @@
+from pathlib import Path
+import json
+import joblib
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier
+
+ROOT=Path(__file__).resolve().parents[1]; DATA=ROOT/'data'/'processed'/'training.csv'; MODEL=ROOT/'models'/'landslide_model.joblib'; REPORT=ROOT/'reports'/'evaluation.json'
+FEATURES=[
+    'rainfall_24h',
+    'rainfall_7d',
+    'elevation',
+    'slope',
+    'historical_landslides'
+]
+
+if not DATA.exists(): raise SystemExit('training.csv missing. Run scripts\\run_real_pipeline.bat first.')
+df=pd.read_csv(DATA).dropna(subset=FEATURES+['target']); y=df.target.astype(int)
+if y.nunique()!=2 or len(df)<40: raise SystemExit('Training data must contain both classes and at least 40 rows.')
+X=df[FEATURES].astype(float)
+Xtr,Xte,ytr,yte=train_test_split(X,y,test_size=.25,random_state=42,stratify=y)
+models={
+ 'random_forest':RandomForestClassifier(n_estimators=400,min_samples_leaf=2,class_weight='balanced',random_state=42,n_jobs=-1),
+ 'xgboost':XGBClassifier(n_estimators=350,max_depth=5,learning_rate=.05,subsample=.85,colsample_bytree=.9,eval_metric='logloss',random_state=42,n_jobs=4,monotone_constraints=(1,1,0,0,0))
+}
+results={}; best_name=None; best_f1=-1; best_model=None
+for name,m in models.items():
+    m.fit(Xtr,ytr); p=m.predict_proba(Xte)[:,1]; pred=(p>=.5).astype(int)
+    metrics={'accuracy':accuracy_score(yte,pred),'precision':precision_score(yte,pred,zero_division=0),'recall':recall_score(yte,pred,zero_division=0),'f1':f1_score(yte,pred,zero_division=0),'roc_auc':roc_auc_score(yte,p),'confusion_matrix':confusion_matrix(yte,pred).tolist()}
+    results[name]=metrics
+    if name == 'xgboost': best_name,best_f1,best_model=name,metrics['f1'],m
+MODEL.parent.mkdir(exist_ok=True); REPORT.parent.mkdir(exist_ok=True)
+best_model.metadata={'model_name':best_name,'features':FEATURES,'training_rows':len(df),'label_definition':'NASA GLC events vs spatial background samples; background is not verified non-landslide','validation':'stratified holdout 25%; no spatial cross-validation'}
+joblib.dump(best_model,MODEL)
+
+# Refresh the monitored-point table with the selected model's probabilities.
+loc=ROOT/'data'/'processed'/'location_features.csv'
+if loc.exists():
+    ld=pd.read_csv(loc); lx=ld[FEATURES].astype(float); ld['probability']=best_model.predict_proba(lx)[:,1]; ld['riskLevel']=pd.cut(ld['probability'],[-1,.30,.55,.75,2],labels=['low','moderate','high','critical']).astype(str); ld['model_source']=best_name; ld.to_csv(loc,index=False)
+REPORT.write_text(json.dumps({'selected_model':best_name,'features':FEATURES,'rows':len(df),'metrics':results,'limitations':best_model.metadata},indent=2))
+print(json.dumps({'selected_model':best_name,'metrics':results},indent=2))
+
+

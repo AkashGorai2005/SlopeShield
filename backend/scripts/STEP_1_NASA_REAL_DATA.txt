@@ -1,0 +1,18 @@
+STEP 1 — NASA REAL LANDSLIDE DATA
+
+What changed:
+- The real-data pipeline now tries NASA's ArcGIS Global Landslide Catalog FeatureServer first.
+- It requests only the North-East India bounding box (20–30 N, 88–98.5 E) instead of downloading the entire CSV.
+- The legacy NASA CSV is kept only as a fallback.
+- Retrieved records are saved to backend/data/raw/nasa_global_landslides.csv.
+- The source URL is written into backend/data/processed/source_manifest.csv.
+
+Test manually from backend:
+  .venv\\Scripts\\Activate.ps1
+  python scripts\\test_nasa_source.py
+
+Then run the full real-data pipeline:
+  python scripts\\bootstrap_real_data.py
+
+Important:
+NASA GLC is a historical landslide inventory, not a live landslide sensor feed. A successful fetch means the events are real records from NASA's catalog; it does not mean the catalog contains every landslide occurring today.
