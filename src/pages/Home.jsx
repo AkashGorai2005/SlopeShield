@@ -14,7 +14,7 @@ import {
   ChevronRight,
 } from "lucide-react";
 
-import "./home.css";
+import "./Home.css";
 
 export default function Home() {
   const { summary, risk, rainfall, warnings } = useProjectData();
