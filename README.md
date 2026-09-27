@@ -11,13 +11,14 @@ The project provides a dashboard for viewing risk conditions, exploring risk geo
 ## 👥 Team
 
 ### Team Name: **Hidden Variables**
+### Team Leader: **Akash Gorai**
 
 | Team Member | Role |
 |---|---|
 | **Adrija Choudhury** | Frontend |
-| **Akash Gorai** | Backend |
+| **Akash Gorai** | Machine Learning | Backend | Deployment |
 | **Pritam Nandi** | Backend |
-| **Anindita Maji** | Database |
+| **Anindita Maji** | Database | Deployment |
 | **Pratima Shaw** | Machine Learning |
 | **Abhishikta Mishra** | Machine Learning |
 
