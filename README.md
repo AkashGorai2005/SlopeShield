@@ -16,7 +16,7 @@ The project provides a dashboard for viewing risk conditions, exploring risk geo
 | Team Member | Role |
 |---|---|
 | **Adrija Choudhury** | Frontend |
-| **Akash Gorai**  | ML & Backend |
+| **Akash Gorai**  | ML & Backend & Deployment |
 | **Pritam Nandi** | Backend |
 | **Anindita Maji** | Database & Deployment |
 | **Pratima Shaw** | Machine Learning |
